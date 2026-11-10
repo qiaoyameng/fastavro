@@ -519,6 +519,7 @@ class Writer(GenericWriter):
             self.encoder = BinaryEncoder(fo)
         self.io = BinaryEncoder(BytesIO())
         self.block_count = 0
+        self._failed = False
         self.sync_interval = sync_interval
         self.compression_level = compression_level
 
@@ -549,36 +550,73 @@ class Writer(GenericWriter):
 
             write_header(self.encoder, self.metadata, self.sync_marker)
 
+    def _check_writable(self):
+        if self._failed:
+            raise RuntimeError("writer is in a failed state")
+
     def dump(self):
-        self.encoder.write_long(self.block_count)
-        self.block_writer(self.encoder, self.io._fo.getvalue(), self.compression_level)
-        self.encoder._fo.write(self.sync_marker)
+        self._check_writable()
+        try:
+            self.encoder.write_long(self.block_count)
+            self.block_writer(
+                self.encoder, self.io._fo.getvalue(), self.compression_level
+            )
+            self.encoder._fo.write(self.sync_marker)
+        except OSError:
+            self._failed = True
+            raise
         self.io._fo.truncate(0)
         self.io._fo.seek(0, SEEK_SET)
         self.block_count = 0
 
     def write(self, record):
+        self._check_writable()
         if self.validate_fn:
             self.validate_fn(
                 record, self.schema, self._named_schemas, "", True, self.options
             )
-        write_data(self.io, record, self.schema, self._named_schemas, "", self.options)
+        block_position = self.io._fo.tell()
+        try:
+            write_data(
+                self.io,
+                record,
+                self.schema,
+                self._named_schemas,
+                "",
+                self.options,
+            )
+        except Exception:
+            self.io._fo.truncate(block_position)
+            self.io._fo.seek(block_position)
+            raise
         self.block_count += 1
         if self.io._fo.tell() >= self.sync_interval:
             self.dump()
 
     def write_block(self, block):
+        self._check_writable()
         # Clear existing block if there are any records pending
         if self.io._fo.tell() or self.block_count > 0:
             self.dump()
-        self.encoder.write_long(block.num_records)
-        self.block_writer(self.encoder, block.bytes_.getvalue(), self.compression_level)
-        self.encoder._fo.write(self.sync_marker)
+        try:
+            self.encoder.write_long(block.num_records)
+            self.block_writer(
+                self.encoder, block.bytes_.getvalue(), self.compression_level
+            )
+            self.encoder._fo.write(self.sync_marker)
+        except OSError:
+            self._failed = True
+            raise
 
     def flush(self):
+        self._check_writable()
         if self.io._fo.tell() or self.block_count > 0:
             self.dump()
-        self.encoder._fo.flush()
+        try:
+            self.encoder._fo.flush()
+        except OSError:
+            self._failed = True
+            raise
 
 
 class JSONWriter(GenericWriter):

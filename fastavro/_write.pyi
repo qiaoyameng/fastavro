@@ -28,6 +28,7 @@ class Writer(GenericWriter):
     encoder: BinaryEncoder
     io: BinaryEncoder
     block_count: int
+    _failed: bool
     sync_interval: int
     compression_level: Optional[int]
     block_writer: Callable

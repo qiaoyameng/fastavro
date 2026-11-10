@@ -34,6 +34,12 @@ from ._read_common import (
     HEADER_SCHEMA,
     missing_codec_lib,
 )
+from ._logical_resolution_py import (
+    LEGACY,
+    EXACT,
+    resolve_logical_value,
+    resolve_logical_default,
+)
 from .const import NAMED_TYPES, AVRO_TYPES
 
 T = TypeVar("T")
@@ -45,6 +51,34 @@ epoch_naive = datetime(1970, 1, 1)
 
 def _default_named_schemas() -> Dict[str, NamedSchemas]:
     return {"writer": {}, "reader": {}}
+
+
+class _LogicalPath:
+    """Shared stack describing the current position inside a record tree.
+
+    Logical resolution errors use it to report the record name and the field
+    path (including array indices and union branches) of the failing value.
+    """
+
+    def __init__(self):
+        self._segments = []
+
+    def push(self, segment):
+        self._segments.append(segment)
+
+    def pop(self):
+        self._segments.pop()
+
+    def __str__(self):
+        if not self._segments:
+            return "<root>"
+        return ".".join(str(segment) for segment in self._segments)
+
+
+def _branch_name(schema):
+    if isinstance(schema, dict):
+        return schema.get("name", schema.get("type"))
+    return schema
 
 
 def match_types(writer_type, reader_type, named_schemas):
@@ -334,15 +368,24 @@ def read_array(
 
     decoder.read_array_start()
 
-    for item in decoder.iter_array():
-        read_items.append(
-            item_reader(
-                decoder,
-                writer_schema,
-                reader_schema,
-                options,
+    logical_path = options.get("_logical_path")
+    index = 0
+    for _ in decoder.iter_array():
+        if logical_path is not None:
+            logical_path.push(f"[{index}]")
+        try:
+            read_items.append(
+                item_reader(
+                    decoder,
+                    writer_schema,
+                    reader_schema,
+                    options,
+                )
             )
-        )
+        finally:
+            if logical_path is not None:
+                logical_path.pop()
+        index += 1
 
     decoder.read_array_end()
 
@@ -391,9 +434,18 @@ def read_map(
 
     decoder.read_map_start()
 
+    logical_path = options.get("_logical_path")
     for item in decoder.iter_map():
         key = decoder.read_utf8()
-        read_items[key] = item_reader(decoder, writer_schema, reader_schema)
+        if logical_path is not None:
+            logical_path.push(f"[{key!r}]")
+        try:
+            read_items[key] = item_reader(
+                decoder, writer_schema, reader_schema
+            )
+        finally:
+            if logical_path is not None:
+                logical_path.pop()
 
     decoder.read_map_end()
 
@@ -421,40 +473,53 @@ def read_union(
     index = decoder.read_index()
     idx_schema = writer_schema[index]
     idx_reader_schema = None
+    logical_path = options.get("_logical_path")
 
-    if reader_schema:
-        # Handle case where the reader schema is just a single type (not union)
-        if not isinstance(reader_schema, list):
-            if match_types(idx_schema, reader_schema, named_schemas):
-                result = read_data(
-                    decoder,
-                    idx_schema,
-                    named_schemas,
-                    reader_schema,
-                    options,
-                )
-            else:
-                raise SchemaResolutionError(
-                    f"schema mismatch: {writer_schema} not found in {reader_schema}"
-                )
-        else:
-            for schema in reader_schema:
-                if match_types(idx_schema, schema, named_schemas):
-                    idx_reader_schema = schema
+    if logical_path is not None:
+        logical_path.push(f"<union:{_branch_name(idx_schema)}>")
+    try:
+
+        if reader_schema:
+            # Handle case where the reader schema is just a single type
+            # (not union)
+            if not isinstance(reader_schema, list):
+                if match_types(idx_schema, reader_schema, named_schemas):
                     result = read_data(
                         decoder,
                         idx_schema,
                         named_schemas,
-                        schema,
+                        reader_schema,
                         options,
                     )
-                    break
+                else:
+                    raise SchemaResolutionError(
+                        f"schema mismatch: {writer_schema} not found in "
+                        f"{reader_schema}"
+                    )
             else:
-                raise SchemaResolutionError(
-                    f"schema mismatch: {writer_schema} not found in {reader_schema}"
-                )
-    else:
-        result = read_data(decoder, idx_schema, named_schemas, None, options)
+                for schema in reader_schema:
+                    if match_types(idx_schema, schema, named_schemas):
+                        idx_reader_schema = schema
+                        result = read_data(
+                            decoder,
+                            idx_schema,
+                            named_schemas,
+                            schema,
+                            options,
+                        )
+                        break
+                else:
+                    raise SchemaResolutionError(
+                        f"schema mismatch: {writer_schema} not found in "
+                        f"{reader_schema}"
+                    )
+        else:
+            result = read_data(
+                decoder, idx_schema, named_schemas, None, options
+            )
+    finally:
+        if logical_path is not None:
+            logical_path.pop()
 
     return_record_name_override = options.get("return_record_name_override")
     return_record_name = options.get("return_record_name")
@@ -526,15 +591,31 @@ def read_record(
          field's value is unset.
     """
     record = {}
+    logical_path = options.get("_logical_path")
+    exact = options.get("logical_resolution", LEGACY) == EXACT
+
+    if logical_path is not None:
+        logical_path.push(writer_schema.get("name", "<record>"))
+
     if reader_schema is None:
-        for field in writer_schema["fields"]:
-            record[field["name"]] = read_data(
-                decoder,
-                field["type"],
-                named_schemas,
-                None,
-                options,
-            )
+        try:
+            for field in writer_schema["fields"]:
+                if logical_path is not None:
+                    logical_path.push(field["name"])
+                try:
+                    record[field["name"]] = read_data(
+                        decoder,
+                        field["type"],
+                        named_schemas,
+                        None,
+                        options,
+                    )
+                finally:
+                    if logical_path is not None:
+                        logical_path.pop()
+        finally:
+            if logical_path is not None:
+                logical_path.pop()
     else:
         readers_field_dict = {}
         aliases_field_dict = {}
@@ -543,31 +624,63 @@ def read_record(
             for alias in f.get("aliases", []):
                 aliases_field_dict[alias] = f
 
-        for field in writer_schema["fields"]:
-            readers_field = readers_field_dict.get(
-                field["name"],
-                aliases_field_dict.get(field["name"]),
-            )
-            if readers_field:
-                readers_field_name = readers_field["name"]
-                record[readers_field_name] = read_data(
-                    decoder,
-                    field["type"],
-                    named_schemas,
-                    readers_field["type"],
-                    options,
+        try:
+            for field in writer_schema["fields"]:
+                readers_field = readers_field_dict.get(
+                    field["name"],
+                    aliases_field_dict.get(field["name"]),
                 )
-                del readers_field_dict[readers_field_name]
-            else:
-                skip_data(decoder, field["type"], named_schemas)
+                if readers_field:
+                    readers_field_name = readers_field["name"]
+                    if logical_path is not None:
+                        logical_path.push(readers_field_name)
+                    try:
+                        record[readers_field_name] = read_data(
+                            decoder,
+                            field["type"],
+                            named_schemas,
+                            readers_field["type"],
+                            options,
+                        )
+                    finally:
+                        if logical_path is not None:
+                            logical_path.pop()
+                    del readers_field_dict[readers_field_name]
+                else:
+                    skip_data(decoder, field["type"], named_schemas)
 
-        # fill in default values
-        for f_name, field in readers_field_dict.items():
-            if "default" in field:
-                record[field["name"]] = field["default"]
-            else:
-                msg = f"No default value for field {field['name']} in {reader_schema['name']}"
-                raise SchemaResolutionError(msg)
+            # fill in default values
+            for f_name, field in readers_field_dict.items():
+                if "default" in field:
+                    if exact:
+                        default_type = field["type"]
+                        if isinstance(default_type, list):
+                            # A union default is encoded using the first branch
+                            default_type = default_type[0]
+                        if logical_path is not None:
+                            logical_path.push(field["name"])
+                        try:
+                            record[field["name"]] = resolve_logical_default(
+                                field["default"],
+                                default_type,
+                                str(logical_path)
+                                if logical_path is not None
+                                else "<root>",
+                            )
+                        finally:
+                            if logical_path is not None:
+                                logical_path.pop()
+                    else:
+                        record[field["name"]] = field["default"]
+                else:
+                    msg = (
+                        f"No default value for field {field['name']} in "
+                        f"{reader_schema['name']}"
+                    )
+                    raise SchemaResolutionError(msg)
+        finally:
+            if logical_path is not None:
+                logical_path.pop()
 
     return record
 
@@ -664,14 +777,27 @@ def read_data(
         except StructError:
             raise EOFError(f"cannot read {record_type} from {decoder.fo}")
 
-        if "logicalType" in writer_schema:
-            logical_type = extract_logical_type(writer_schema)
+        logical_type = extract_logical_type(writer_schema)
+        exact = options.get("logical_resolution", LEGACY) == EXACT
+
+        if exact and isinstance(writer_schema, dict):
+            logical_path = options.get("_logical_path")
+            return resolve_logical_value(
+                data,
+                writer_schema,
+                reader_schema,
+                str(logical_path) if logical_path is not None else "<root>",
+            )
+
+        if logical_type is not None:
             fn = LOGICAL_READERS.get(logical_type)
             if fn:
                 return fn(data, writer_schema, reader_schema)
 
         if reader_schema is not None:
-            return maybe_promote(data, record_type, extract_record_type(reader_schema))
+            return maybe_promote(
+                data, record_type, extract_record_type(reader_schema)
+            )
         else:
             return data
     else:
@@ -818,12 +944,15 @@ def _iter_avro_records(
         block_fo = read_block(decoder)
 
         for i in range(block_count):
+            record_options = dict(options)
+            if record_options.get("logical_resolution", LEGACY) == EXACT:
+                record_options["_logical_path"] = _LogicalPath()
             yield read_data(
                 BinaryDecoder(block_fo),
                 writer_schema,
                 named_schemas,
                 reader_schema,
-                options,
+                record_options,
             )
 
         skip_sync(decoder.fo, sync_marker)
@@ -919,12 +1048,15 @@ class Block:
 
     def __iter__(self):
         for i in range(self.num_records):
+            record_options = dict(self.options)
+            if record_options.get("logical_resolution", LEGACY) == EXACT:
+                record_options["_logical_path"] = _LogicalPath()
             yield read_data(
                 BinaryDecoder(self.bytes_),
                 self.writer_schema,
                 self._named_schemas,
                 self.reader_schema,
-                self.options,
+                record_options,
             )
 
     def __str__(self):
@@ -947,6 +1079,12 @@ class file_reader(Generic[T]):
         else:
             # If a decoder was not provided, assume binary
             self.decoder = BinaryDecoder(fo_or_decoder)
+
+        if options.get("logical_resolution", LEGACY) not in (LEGACY, EXACT):
+            raise ValueError(
+                "logical_resolution must be either 'legacy' or 'exact', "
+                f"got {options['logical_resolution']!r}"
+            )
 
         self._named_schemas = _default_named_schemas()
         if reader_schema:
@@ -1098,6 +1236,7 @@ class reader(file_reader[AvroMessage]):
         handle_unicode_errors: str = "strict",
         return_named_type: bool = False,
         return_named_type_override: bool = False,
+        logical_resolution: str = LEGACY,
     ):
         options = {
             "return_record_name": return_record_name,
@@ -1105,6 +1244,7 @@ class reader(file_reader[AvroMessage]):
             "handle_unicode_errors": handle_unicode_errors,
             "return_named_type": return_named_type,
             "return_named_type_override": return_named_type_override,
+            "logical_resolution": logical_resolution,
         }
         super().__init__(fo, reader_schema, options)
 
@@ -1118,12 +1258,15 @@ class reader(file_reader[AvroMessage]):
 
             def _elems():
                 while not self.decoder.done:
+                    record_options = dict(self.options)
+                    if record_options.get("logical_resolution", LEGACY) == EXACT:
+                        record_options["_logical_path"] = _LogicalPath()
                     yield read_data(
                         self.decoder,
                         self.writer_schema,
                         self._named_schemas,
                         self.reader_schema,
-                        self.options,
+                        record_options,
                     )
                     self.decoder.drain()
 
@@ -1213,6 +1356,7 @@ class block_reader(file_reader[Block]):
         handle_unicode_errors: str = "strict",
         return_named_type: bool = False,
         return_named_type_override: bool = False,
+        logical_resolution: str = LEGACY,
     ):
         options = {
             "return_record_name": return_record_name,
@@ -1220,6 +1364,7 @@ class block_reader(file_reader[Block]):
             "handle_unicode_errors": handle_unicode_errors,
             "return_named_type": return_named_type,
             "return_named_type_override": return_named_type_override,
+            "logical_resolution": logical_resolution,
         }
         super().__init__(fo, reader_schema, options)
 
@@ -1245,6 +1390,7 @@ def schemaless_reader(
     handle_unicode_errors: str = "strict",
     return_named_type: bool = False,
     return_named_type_override: bool = False,
+    logical_resolution: str = LEGACY,
 ) -> AvroMessage:
     """Reads a single record written using the
     :meth:`~fastavro._write_py.schemaless_writer`
@@ -1283,6 +1429,12 @@ def schemaless_reader(
         Default `strict`. Should be set to a valid string that can be used in
         the errors argument of the string decode() function. Examples include
         `replace` and `ignore`
+    logical_resolution
+        Default `legacy` keeps the historical behaviour where the reader
+        schema's logical type is ignored. When set to `exact`, logical types
+        are resolved against the reader schema with auditable, lossless
+        conversions and a :class:`LogicalResolutionError` is raised whenever a
+        conversion would lose information or is not supported.
 
 
     Example::
@@ -1293,6 +1445,12 @@ def schemaless_reader(
 
     Note: The ``schemaless_reader`` can only read a single record.
     """
+    if logical_resolution not in (LEGACY, EXACT):
+        raise ValueError(
+            "logical_resolution must be either 'legacy' or 'exact', "
+            f"got {logical_resolution!r}"
+        )
+
     if writer_schema == reader_schema:
         # No need for the reader schema if they are the same
         reader_schema = None
@@ -1311,7 +1469,11 @@ def schemaless_reader(
         "handle_unicode_errors": handle_unicode_errors,
         "return_named_type": return_named_type,
         "return_named_type_override": return_named_type_override,
+        "logical_resolution": logical_resolution,
     }
+
+    if logical_resolution == EXACT:
+        options["_logical_path"] = _LogicalPath()
 
     return read_data(
         decoder,

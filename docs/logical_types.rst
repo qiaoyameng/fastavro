@@ -17,6 +17,67 @@ Fastavro is missing support for the following official logical types:
 
 * duration
 
+Logical type resolution between writer and reader schemas
+---------------------------------------------------------
+
+By default (``logical_resolution="legacy"``) fastavro converts every value
+using the logical type of the *writer* schema and ignores any logical type
+declared on the reader schema. This keeps the historical behaviour unchanged.
+
+Passing ``logical_resolution="exact"`` to :class:`fastavro.reader`,
+:class:`fastavro.block_reader` or :func:`fastavro.schemaless_reader` makes the
+reader schema's logical type authoritative. Every conversion has to be exact;
+otherwise a :class:`fastavro.read.LogicalResolutionError` is raised. The first
+version covers ``timestamp-millis``, ``timestamp-micros``,
+``local-timestamp-millis``, ``local-timestamp-micros`` and the ``bytes`` /
+``fixed`` decimal variants.
+
+The exact rules are:
+
+* microsecond timestamps may be downgraded to millisecond timestamps only when
+  the raw value is evenly divisible by 1000; millisecond to microsecond is
+  always exact;
+* UTC (``timestamp-*``) and ``local-timestamp-*`` values are never converted
+  into each other automatically;
+* decimal scale increases must be exact multiplications, while scale decreases
+  raise if non-zero digits would be dropped; the reader ``precision`` and, for
+  ``fixed`` decimals, the byte capacity are both checked;
+* logical types that are not part of this feature (for example ``date``) and
+  unknown logical types are never guessed;
+* record default values use the same exact rules, and error messages include
+  the record name and field path, including array indices, map keys and union
+  branches.
+
+Example::
+
+    from io import BytesIO
+    import fastavro
+
+    writer_schema = {
+        "type": "record",
+        "name": "Event",
+        "fields": [
+            {"name": "ts", "type": {
+                "type": "long", "logicalType": "timestamp-micros"}},
+        ],
+    }
+
+    reader_schema = {
+        "type": "record",
+        "name": "Event",
+        "fields": [
+            {"name": "ts", "type": {
+                "type": "long", "logicalType": "timestamp-millis"}},
+        ],
+    }
+
+    fo = BytesIO()
+    fastavro.writer(fo, writer_schema, [{"ts": 1234000}])
+    fo.seek(0)
+    records = list(
+        fastavro.reader(fo, reader_schema, logical_resolution="exact")
+    )
+
 How to specify logical types in your schemas
 --------------------------------------------
 

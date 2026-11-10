@@ -10,3 +10,5 @@ fastavro.read
 .. autofunction:: fastavro._read_py.schemaless_reader
 
 .. autofunction:: fastavro._read_py.is_avro
+
+.. autoexception:: fastavro.read.LogicalResolutionError

@@ -42,6 +42,7 @@ class reader(file_reader[AvroMessage]):
         handle_unicode_errors: str = ...,
         return_named_type: bool = ...,
         return_named_type_override: bool = ...,
+        logical_resolution: str = ...,
     ): ...
 
 class block_reader(file_reader[Block]):
@@ -54,6 +55,7 @@ class block_reader(file_reader[Block]):
         handle_unicode_errors: str = ...,
         return_named_type: bool = ...,
         return_named_type_override: bool = ...,
+        logical_resolution: str = ...,
     ): ...
 
 class Block:
@@ -85,6 +87,7 @@ def schemaless_reader(
     handle_unicode_errors: str = ...,
     return_named_type: bool = ...,
     return_named_type_override: bool = ...,
+    logical_resolution: str = ...,
 ) -> AvroMessage: ...
 def is_avro(path_or_buffer: Union[str, IO]) -> bool: ...
 

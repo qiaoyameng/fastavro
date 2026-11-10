@@ -6,6 +6,7 @@ except ImportError:
 from . import json_read
 from . import logical_readers
 from . import _read_common
+from ._logical_resolution_py import LEGACY, EXACT, LogicalResolutionError
 
 # Private API
 HEADER_SCHEMA = _read_common.HEADER_SCHEMA
@@ -28,5 +29,11 @@ __all__ = [
     "is_avro",
     "block_reader",
     "SchemaResolutionError",
+    "LogicalResolutionError",
+    "LOGICAL_RESOLUTION_LEGACY",
+    "LOGICAL_RESOLUTION_EXACT",
     "LOGICAL_READERS",
 ]
+
+LOGICAL_RESOLUTION_LEGACY = LEGACY
+LOGICAL_RESOLUTION_EXACT = EXACT

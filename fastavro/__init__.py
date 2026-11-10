@@ -48,6 +48,7 @@ import fastavro.read
 import fastavro.write
 import fastavro.schema
 import fastavro.validation
+import fastavro.compatibility
 
 reader = fastavro.read.reader
 json_reader = fastavro.json_read.json_reader

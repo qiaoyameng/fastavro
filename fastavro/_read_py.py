@@ -9,6 +9,7 @@ import json
 import lzma
 import sys
 import zlib
+from copy import deepcopy
 from datetime import datetime, timezone
 from decimal import Context
 from io import BytesIO
@@ -694,6 +695,477 @@ def skip_data(decoder, writer_schema, named_schemas):
         skip_data(decoder, named_schemas["writer"][record_type], named_schemas)
 
 
+def _plan_cache_key(schema):
+    if schema is None or isinstance(schema, str):
+        return schema
+    return id(schema)
+
+
+def _compile_read_plan(w_schema, r_schema, named_schemas, options, cache):
+    """Compile a reusable read plan for a writer/reader schema pair.
+
+    All schema resolution decisions (field matching, aliases, defaults, union
+    branch matching, named type lookups) are performed once here instead of
+    on every record. The returned plan is a plain ``decoder -> value``
+    callable that only captures immutable snapshots (names, sizes, deep
+    copied defaults, other plans), never the caller's schema dictionaries.
+    """
+    key = (_plan_cache_key(w_schema), _plan_cache_key(r_schema))
+    holder = cache.get(key)
+    if holder is not None:
+        if holder:
+            return holder[0]
+        # Recursive schema; the plan is still being built. Defer the lookup
+        # to read time when the holder is guaranteed to be filled.
+        return lambda decoder: holder[0](decoder)
+    holder = []
+    cache[key] = holder
+    plan = _compile_read_plan_uncached(
+        w_schema, r_schema, named_schemas, options, cache
+    )
+    holder.append(plan)
+    return plan
+
+
+def _compile_read_plan_uncached(w_schema, r_schema, named_schemas, options, cache):
+    record_type = extract_record_type(w_schema)
+
+    if r_schema:
+        r_schema = match_schemas(w_schema, r_schema, named_schemas)
+
+    if record_type not in READERS:
+        # Named type reference; resolve it and compile a plan for the
+        # underlying schema.
+        return _compile_read_plan(
+            named_schemas["writer"][record_type],
+            named_schemas["reader"].get(r_schema),
+            named_schemas,
+            options,
+            cache,
+        )
+
+    plan = _compile_concrete_plan(
+        record_type, w_schema, r_schema, named_schemas, options, cache
+    )
+
+    plan = _wrap_plan_struct_error(plan, record_type)
+
+    if "logicalType" in w_schema:
+        logical_type = extract_logical_type(w_schema)
+        fn = LOGICAL_READERS.get(logical_type)
+        if fn:
+            # Snapshot the schema attributes the logical readers need so the
+            # plan does not retain dicts the caller could keep mutating.
+            w_snapshot = dict(w_schema)
+            r_snapshot = dict(r_schema) if isinstance(r_schema, dict) else r_schema
+            plan = _wrap_plan_logical(plan, fn, w_snapshot, r_snapshot)
+
+    if r_schema is not None:
+        reader_type = extract_record_type(r_schema)
+        if record_type in ("int", "long") and reader_type in ("float", "double"):
+            plan = _wrap_plan_float(plan)
+        elif record_type == "string" and reader_type == "bytes":
+            plan = _wrap_plan_encode(plan)
+        elif record_type == "bytes" and reader_type == "string":
+            plan = _wrap_plan_decode(plan)
+
+    return plan
+
+
+def _wrap_plan_struct_error(base_plan, record_type):
+    def plan(decoder):
+        try:
+            return base_plan(decoder)
+        except StructError:
+            raise EOFError(f"cannot read {record_type} from {decoder.fo}")
+
+    return plan
+
+
+def _wrap_plan_logical(base_plan, fn, w_snapshot, r_snapshot):
+    def plan(decoder):
+        return fn(base_plan(decoder), w_snapshot, r_snapshot)
+
+    return plan
+
+
+def _wrap_plan_float(base_plan):
+    def plan(decoder):
+        return float(base_plan(decoder))
+
+    return plan
+
+
+def _wrap_plan_encode(base_plan):
+    def plan(decoder):
+        return base_plan(decoder).encode()
+
+    return plan
+
+
+def _wrap_plan_decode(base_plan):
+    def plan(decoder):
+        return base_plan(decoder).decode()
+
+    return plan
+
+
+def _compile_concrete_plan(
+    record_type, w_schema, r_schema, named_schemas, options, cache
+):
+    if record_type == "null":
+        return lambda decoder: decoder.read_null()
+    if record_type == "boolean":
+        return lambda decoder: decoder.read_boolean()
+    if record_type == "int":
+        return lambda decoder: decoder.read_int()
+    if record_type == "long":
+        return lambda decoder: decoder.read_long()
+    if record_type == "float":
+        return lambda decoder: decoder.read_float()
+    if record_type == "double":
+        return lambda decoder: decoder.read_double()
+    if record_type == "bytes":
+        return lambda decoder: decoder.read_bytes()
+    if record_type == "string":
+        handle_unicode_errors = options.get("handle_unicode_errors", "strict")
+        return lambda decoder: decoder.read_utf8(
+            handle_unicode_errors=handle_unicode_errors
+        )
+    if record_type == "fixed":
+        size = w_schema["size"]
+        return lambda decoder: decoder.read_fixed(size)
+    if record_type == "enum":
+        return _compile_enum_plan(w_schema, r_schema)
+    if record_type == "array":
+        return _compile_array_plan(w_schema, r_schema, named_schemas, options, cache)
+    if record_type == "map":
+        return _compile_map_plan(w_schema, r_schema, named_schemas, options, cache)
+    if record_type in ("union", "error_union"):
+        return _compile_union_plan(w_schema, r_schema, named_schemas, options, cache)
+    # record, error, request
+    return _compile_record_plan(w_schema, r_schema, named_schemas, options, cache)
+
+
+def _compile_enum_plan(w_schema, r_schema):
+    w_symbols = tuple(w_schema["symbols"])
+    if r_schema:
+        r_symbols = frozenset(r_schema["symbols"])
+        r_symbols_list = list(r_schema["symbols"])
+        r_default = r_schema.get("default")
+        r_name = r_schema["name"]
+
+        def plan(decoder):
+            symbol = w_symbols[decoder.read_enum()]
+            if symbol not in r_symbols:
+                if r_default:
+                    return r_default
+                msg = (
+                    f"{symbol} not found in reader symbol list {r_name}, "
+                    f"known symbols: {r_symbols_list}"
+                )
+                raise SchemaResolutionError(msg)
+            return symbol
+
+        return plan
+
+    return lambda decoder: w_symbols[decoder.read_enum()]
+
+
+def _compile_array_plan(w_schema, r_schema, named_schemas, options, cache):
+    if r_schema:
+        item_plan = _compile_read_plan(
+            w_schema["items"], r_schema["items"], named_schemas, options, cache
+        )
+    else:
+        item_plan = _compile_read_plan(
+            w_schema["items"], None, named_schemas, options, cache
+        )
+
+    def plan(decoder):
+        read_items = []
+        decoder.read_array_start()
+        for _ in decoder.iter_array():
+            read_items.append(item_plan(decoder))
+        decoder.read_array_end()
+        return read_items
+
+    return plan
+
+
+def _compile_map_plan(w_schema, r_schema, named_schemas, options, cache):
+    if r_schema:
+        value_plan = _compile_read_plan(
+            w_schema["values"], r_schema["values"], named_schemas, options, cache
+        )
+    else:
+        value_plan = _compile_read_plan(
+            w_schema["values"], None, named_schemas, options, cache
+        )
+
+    def plan(decoder):
+        read_items = {}
+        decoder.read_map_start()
+        for _ in decoder.iter_map():
+            key = decoder.read_utf8()
+            read_items[key] = value_plan(decoder)
+        decoder.read_map_end()
+        return read_items
+
+    return plan
+
+
+def _compile_union_plan(w_schema, r_schema, named_schemas, options, cache):
+    branch_plans = []
+    for idx_schema in w_schema:
+        idx_reader_schema = None
+        if r_schema:
+            if not isinstance(r_schema, list):
+                if match_types(idx_schema, r_schema, named_schemas):
+                    branch_plan = _compile_read_plan(
+                        idx_schema, r_schema, named_schemas, options, cache
+                    )
+                else:
+                    branch_plan = _compile_union_mismatch_plan(w_schema, r_schema)
+            else:
+                for schema in r_schema:
+                    if match_types(idx_schema, schema, named_schemas):
+                        idx_reader_schema = schema
+                        branch_plan = _compile_read_plan(
+                            idx_schema, schema, named_schemas, options, cache
+                        )
+                        break
+                else:
+                    branch_plan = _compile_union_mismatch_plan(w_schema, r_schema)
+        else:
+            branch_plan = _compile_read_plan(
+                idx_schema, None, named_schemas, options, cache
+            )
+
+        branch_name = _union_branch_name(
+            idx_schema, idx_reader_schema, w_schema, named_schemas, options
+        )
+        branch_plans.append((branch_plan, branch_name))
+
+    def plan(decoder):
+        index = decoder.read_index()
+        branch_plan, branch_name = branch_plans[index]
+        result = branch_plan(decoder)
+        if branch_name is None:
+            return result
+        return (branch_name, result)
+
+    return plan
+
+
+def _compile_union_mismatch_plan(w_schema, r_schema):
+    msg = f"schema mismatch: {w_schema} not found in {r_schema}"
+
+    def plan(decoder):
+        raise SchemaResolutionError(msg)
+
+    return plan
+
+
+def _union_branch_name(idx_schema, idx_reader_schema, w_schema, named_schemas, options):
+    """Compute, at compile time, whether a union branch result should be
+    wrapped in a (name, result) tuple and what that name is."""
+    return_record_name_override = options.get("return_record_name_override")
+    return_record_name = options.get("return_record_name")
+    return_named_type_override = options.get("return_named_type_override")
+    return_named_type = options.get("return_named_type")
+
+    idx_type = extract_record_type(idx_schema)
+    if return_named_type_override and is_single_name_union(w_schema):
+        return None
+    elif return_named_type and idx_type in NAMED_TYPES:
+        return idx_reader_schema["name"] if idx_reader_schema else idx_schema["name"]
+    elif return_named_type and idx_type not in AVRO_TYPES:
+        if idx_reader_schema:
+            return named_schemas["reader"][idx_reader_schema]["name"]
+        return named_schemas["writer"][idx_schema]["name"]
+    elif return_record_name_override and is_single_record_union(w_schema):
+        return None
+    elif return_record_name and idx_type == "record":
+        return idx_reader_schema["name"] if idx_reader_schema else idx_schema["name"]
+    elif return_record_name and idx_type not in AVRO_TYPES:
+        if idx_reader_schema:
+            return named_schemas["reader"][idx_reader_schema]["name"]
+        return named_schemas["writer"][idx_schema]["name"]
+    return None
+
+
+def _compile_record_plan(w_schema, r_schema, named_schemas, options, cache):
+    if r_schema is None:
+        field_plans = [
+            (
+                field["name"],
+                _compile_read_plan(
+                    field["type"], None, named_schemas, options, cache
+                ),
+            )
+            for field in w_schema["fields"]
+        ]
+
+        def plan(decoder):
+            record = {}
+            for field_name, field_plan in field_plans:
+                record[field_name] = field_plan(decoder)
+            return record
+
+        return plan
+
+    readers_field_dict = {}
+    aliases_field_dict = {}
+    for field in r_schema["fields"]:
+        readers_field_dict[field["name"]] = field
+        for alias in field.get("aliases", []):
+            aliases_field_dict[alias] = field
+
+    field_plans = []
+    for field in w_schema["fields"]:
+        readers_field = readers_field_dict.get(
+            field["name"],
+            aliases_field_dict.get(field["name"]),
+        )
+        if readers_field:
+            readers_field_name = readers_field["name"]
+            field_plan = _compile_read_plan(
+                field["type"],
+                readers_field["type"],
+                named_schemas,
+                options,
+                cache,
+            )
+            field_plans.append((readers_field_name, field_plan))
+            del readers_field_dict[readers_field_name]
+        else:
+            field_plans.append(
+                (None, _compile_skip_plan(field["type"], named_schemas, {}))
+            )
+
+    default_plans = []
+    for field in readers_field_dict.values():
+        if "default" in field:
+            # Snapshot the default so later caller mutations of the schema
+            # cannot affect the plan.
+            default_plans.append((field["name"], deepcopy(field["default"])))
+        else:
+            msg = (
+                f"No default value for field {field['name']} "
+                f"in {r_schema['name']}"
+            )
+
+            def plan(decoder, msg=msg):
+                raise SchemaResolutionError(msg)
+
+            return plan
+
+    def plan(decoder):
+        record = {}
+        for field_name, field_plan in field_plans:
+            value = field_plan(decoder)
+            if field_name is not None:
+                record[field_name] = value
+        for field_name, default in default_plans:
+            if isinstance(default, (list, dict)):
+                # Mutable defaults must not be shared between records
+                record[field_name] = deepcopy(default)
+            else:
+                record[field_name] = default
+        return record
+
+    return plan
+
+
+def _compile_skip_plan(w_schema, named_schemas, cache):
+    """Compile a plan that skips data written with ``w_schema``."""
+    key = _plan_cache_key(w_schema)
+    holder = cache.get(key)
+    if holder is not None:
+        if holder:
+            return holder[0]
+        return lambda decoder: holder[0](decoder)
+    holder = []
+    cache[key] = holder
+    plan = _compile_skip_plan_uncached(w_schema, named_schemas, cache)
+    holder.append(plan)
+    return plan
+
+
+def _compile_skip_plan_uncached(w_schema, named_schemas, cache):
+    record_type = extract_record_type(w_schema)
+
+    if record_type not in SKIPS:
+        return _compile_skip_plan(
+            named_schemas["writer"][record_type], named_schemas, cache
+        )
+
+    if record_type == "null":
+        return lambda decoder: decoder.read_null()
+    if record_type == "boolean":
+        return lambda decoder: decoder.read_boolean()
+    if record_type == "int":
+        return lambda decoder: decoder.read_int()
+    if record_type == "long":
+        return lambda decoder: decoder.read_long()
+    if record_type == "float":
+        return lambda decoder: decoder.read_float()
+    if record_type == "double":
+        return lambda decoder: decoder.read_double()
+    if record_type == "bytes":
+        return lambda decoder: decoder.read_bytes()
+    if record_type == "string":
+        return lambda decoder: decoder.read_utf8()
+    if record_type == "fixed":
+        size = w_schema["size"]
+        return lambda decoder: decoder.read_fixed(size)
+    if record_type == "enum":
+        return lambda decoder: decoder.read_enum()
+    if record_type == "array":
+        item_plan = _compile_skip_plan(w_schema["items"], named_schemas, cache)
+
+        def plan(decoder):
+            decoder.read_array_start()
+            for _ in decoder.iter_array():
+                item_plan(decoder)
+            decoder.read_array_end()
+
+        return plan
+    if record_type == "map":
+        value_plan = _compile_skip_plan(w_schema["values"], named_schemas, cache)
+
+        def plan(decoder):
+            decoder.read_map_start()
+            for _ in decoder.iter_map():
+                decoder.read_utf8()
+                value_plan(decoder)
+            decoder.read_map_end()
+
+        return plan
+    if record_type in ("union", "error_union"):
+        branch_plans = [
+            _compile_skip_plan(branch, named_schemas, cache) for branch in w_schema
+        ]
+
+        def plan(decoder):
+            index = decoder.read_index()
+            branch_plans[index](decoder)
+
+        return plan
+    # record, error, request
+    field_plans = [
+        _compile_skip_plan(field["type"], named_schemas, cache)
+        for field in w_schema["fields"]
+    ]
+
+    def plan(decoder):
+        for field_plan in field_plans:
+            field_plan(decoder)
+
+    return plan
+
+
 def skip_sync(fo, sync_marker):
     """Skip an expected sync marker, complaining if it doesn't match"""
     if fo.read(SYNC_SIZE) != sync_marker:
@@ -809,6 +1281,7 @@ def _iter_avro_records(
         raise ValueError(f"Unrecognized codec: {codec}")
 
     block_count = 0
+    read_plan = None
     while True:
         try:
             block_count = decoder.read_long()
@@ -818,13 +1291,13 @@ def _iter_avro_records(
         block_fo = read_block(decoder)
 
         for i in range(block_count):
-            yield read_data(
-                BinaryDecoder(block_fo),
-                writer_schema,
-                named_schemas,
-                reader_schema,
-                options,
-            )
+            if read_plan is None:
+                # Compile the writer/reader schema matching decisions once
+                # instead of re-deriving them for every record.
+                read_plan = _compile_read_plan(
+                    writer_schema, reader_schema, named_schemas, options, {}
+                )
+            yield read_plan(BinaryDecoder(block_fo))
 
         skip_sync(decoder.fo, sync_marker)
 
@@ -918,14 +1391,17 @@ class Block:
         self.options = options
 
     def __iter__(self):
+        read_plan = None
         for i in range(self.num_records):
-            yield read_data(
-                BinaryDecoder(self.bytes_),
-                self.writer_schema,
-                self._named_schemas,
-                self.reader_schema,
-                self.options,
-            )
+            if read_plan is None:
+                read_plan = _compile_read_plan(
+                    self.writer_schema,
+                    self.reader_schema,
+                    self._named_schemas,
+                    self.options,
+                    {},
+                )
+            yield read_plan(BinaryDecoder(self.bytes_))
 
     def __str__(self):
         return (
@@ -1117,14 +1593,17 @@ class reader(file_reader[AvroMessage]):
             self._named_schemas["reader"] = {}
 
             def _elems():
+                read_plan = None
                 while not self.decoder.done:
-                    yield read_data(
-                        self.decoder,
-                        self.writer_schema,
-                        self._named_schemas,
-                        self.reader_schema,
-                        self.options,
-                    )
+                    if read_plan is None:
+                        read_plan = _compile_read_plan(
+                            self.writer_schema,
+                            self.reader_schema,
+                            self._named_schemas,
+                            self.options,
+                            {},
+                        )
+                    yield read_plan(self.decoder)
                     self.decoder.drain()
 
             self._elems = _elems()
@@ -1313,13 +1792,10 @@ def schemaless_reader(
         "return_named_type_override": return_named_type_override,
     }
 
-    return read_data(
-        decoder,
-        writer_schema,
-        named_schemas,
-        reader_schema,
-        options,
+    read_plan = _compile_read_plan(
+        writer_schema, reader_schema, named_schemas, options, {}
     )
+    return read_plan(decoder)
 
 
 def is_avro(path_or_buffer: Union[str, IO]) -> bool:

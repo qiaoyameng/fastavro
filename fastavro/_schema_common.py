@@ -48,6 +48,20 @@ class SchemaParseException(Exception):
     pass
 
 
+class SchemaConflictError(Exception):
+    """Raised when independently parsed schemas cannot be combined.
+
+    The ``conflicts`` attribute lists every conflicting named type together
+    with the full name and the source of each declaration, so that callers can
+    supply a complete rename mapping instead of having one named schema
+    silently overwrite another.
+    """
+
+    def __init__(self, message, conflicts=None):
+        super().__init__(message)
+        self.conflicts = [] if conflicts is None else conflicts
+
+
 def rabin_fingerprint(data):
     empty_64 = 0xC15D213AA4D7A795
 

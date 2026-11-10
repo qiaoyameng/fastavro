@@ -8,3 +8,5 @@ fastavro.schema
 .. autofunction:: fastavro._schema_py.load_schema_ordered
 .. autofunction:: fastavro._schema_py.to_parsing_canonical_form
 .. autofunction:: fastavro._schema_py.fingerprint
+.. autofunction:: fastavro._combine_py.combine_schemas
+.. autoexception:: fastavro._schema_common.SchemaConflictError

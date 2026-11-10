@@ -3,7 +3,8 @@ try:
 except ImportError:
     from . import _schema_py as _schema  # type: ignore
 
-from ._schema_common import UnknownType, SchemaParseException
+from ._schema_common import UnknownType, SchemaParseException, SchemaConflictError
+from .combine import combine_schemas
 
 # Private API
 schema_name = _schema.schema_name  # type: ignore
@@ -26,7 +27,9 @@ __all__ = [
     "UnknownType",
     "load_schema",
     "SchemaParseException",
+    "SchemaConflictError",
     "parse_schema",
+    "combine_schemas",
     "fullname",
     "expand_schema",
     "load_schema_ordered",

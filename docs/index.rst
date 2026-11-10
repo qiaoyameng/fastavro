@@ -88,6 +88,7 @@ fastavro
 
    reader
    writer
+   merge
    json_reader
    json_writer
    schema

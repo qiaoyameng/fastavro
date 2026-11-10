@@ -1,3 +1,8 @@
+2026-11-10
+* Add ``fastavro.merge`` for combining Avro OCF files by copying their
+  already compressed blocks (``null`` and ``deflate`` codecs only) instead of
+  re-compressing record by record
+
 2026-10-07 version 1.13.1
 * Match reader named schema reference with inline writer schema (@AnkitaAdvitot)
 

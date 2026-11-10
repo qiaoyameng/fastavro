@@ -48,6 +48,11 @@ import fastavro.read
 import fastavro.write
 import fastavro.schema
 import fastavro.validation
+from fastavro.ocf import (
+    merge,
+    iter_raw_blocks,
+    OCFMergeError,
+)
 
 reader = fastavro.read.reader
 json_reader = fastavro.json_read.json_reader
